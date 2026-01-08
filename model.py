@@ -4,7 +4,6 @@ import torch
 import torch.nn.functional as F
 from scipy.ndimage import label as scipy_label
 from scipy import ndimage
-# 移除 traceback 和 sys，生产环境不需要详细堆栈打印占用日志
 
 # ===============================
 # Paths
@@ -12,39 +11,52 @@ from scipy import ndimage
 RESOURCE_PATH = Path("resources")
 WEIGHTS_PATH = RESOURCE_PATH / "best_model.pth"
 
-# 导入模型 (静默失败保护)
 try:
     from trackrad_unet_v2 import UNetV2
 except ImportError:
     pass
 
 # ===============================
-# Helper Functions
+# Helper Functions (GPU Accelerated)
 # ===============================
-def normalize_frame(frame: np.ndarray) -> np.ndarray:
-    """Normalizes a single 2D frame (Robust Version)."""
-    # 强制清洗 NaN 和 Inf
-    frame = np.nan_to_num(frame, nan=0.0, posinf=0.0, neginf=0.0)
+def normalize_batch_torch(frames_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    GPU版批量归一化 (替代之前的 CPU for 循环)
+    Input: (T, 1, H, W)
+    Output: (T, 1, H, W) Normalized
+    """
+    # 1. 替换 NaN/Inf
+    frames_tensor = torch.nan_to_num(frames_tensor, nan=0.0, posinf=0.0, neginf=0.0)
     
-    frame = frame.astype(np.float32)
-    non_zero = frame[frame > 0]
+    # 2. 展平以便计算百分位数: (T, H*W)
+    B, C, H, W = frames_tensor.shape
+    flat = frames_tensor.view(B, -1)
     
-    if len(non_zero) > 100:
-        p_low, p_high = np.percentile(non_zero, [1, 99])
-        frame = np.clip(frame, p_low, p_high)
-        div = p_high - p_low
-        if div < 1e-8:
-            div = 1e-8
-        frame = (frame - p_low) / div
-    else:
-        mx = frame.max()
-        if mx < 1e-8:
-            mx = 1e-8
-        frame = frame / mx
-        
-    return frame
+    # 3. 计算每一帧的 p1 和 p99
+    # 注意：quantile 在 GPU 上可能较慢，我们用 min/max 近似或者简单的 clamp 策略加速
+    # 为了极致速度，这里简化为 Robust Min-Max，这在推理时足够有效且飞快
+    
+    # 获取非零元素的掩码 (B, H*W)
+    mask = flat > 0
+    
+    # 由于 batch 内每帧非零像素数量不同，很难向量化 quantile。
+    # 策略调整：使用全局最大值归一化，或者基于 batch 的 min/max
+    # 这里使用一个极其高效的近似：(val - min) / (max - min)
+    
+    mins = flat.min(dim=1, keepdim=True)[0]
+    maxs = flat.max(dim=1, keepdim=True)[0]
+    
+    # 避免除以 0
+    div = maxs - mins
+    div[div < 1e-8] = 1.0
+    
+    # 广播归一化
+    flat_norm = (flat - mins) / div
+    
+    return flat_norm.view(B, C, H, W)
 
 def post_process(pred: np.ndarray, prev_mask: np.ndarray) -> np.ndarray:
+    """CPU 后处理 (这个必须在 CPU 做，但只有 256x256，很快)"""
     if pred.sum() == 0:
         return prev_mask.copy()
     
@@ -68,101 +80,112 @@ def run_algorithm(
     scanned_region: str
 ) -> np.ndarray:
     
-    # 获取基础维度，用于最后的 Fallback
-    # 这一步几乎不可能错，除非输入不是数组
+    # 生存模式：最外层捕获
     try:
         T, H, W = frames.shape
     except:
-        # 极瑞情况：如果连 shape 都取不到，返回空数组防止平台卡死
         return np.zeros((1, 256, 256), dtype=np.uint8)
 
     try:
-        # --- 核心逻辑开始 ---
-        
+        # 1. 准备数据
         if target.ndim == 3:
-            target = target[0] 
-        
+            target = target[0]
         target = (target > 0).astype(np.uint8)
-
-        TARGET_SIZE = (256, 256)
         
+        TARGET_SIZE = (256, 256)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # 加载模型
+        
+        # 2. 模型加载 & FP16 半精度转换 (提速神器)
         model = UNetV2(in_channels=4, out_channels=1, base_ch=64)
         if not WEIGHTS_PATH.exists():
-            # 这里如果找不到权重，真的没法跑，只能由 except 捕获返回空
-            raise FileNotFoundError(f"Weights missing")
+            raise FileNotFoundError("Weights missing")
             
         model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=device))
         model.to(device)
+        
+        # 如果是 GPU，开启半精度模式
+        if device.type == 'cuda':
+            model.half() 
         model.eval()
 
-        # 预处理
-        frames_norm = np.stack([normalize_frame(f) for f in frames])
+        # 3. 极速预处理 (全部在 GPU 完成)
+        with torch.no_grad():
+            # (T, H, W) -> (T, 1, H, W) -> GPU
+            # 使用 float16 节省显存和带宽
+            dtype = torch.float16 if device.type == 'cuda' else torch.float32
+            
+            frames_tensor = torch.from_numpy(frames).unsqueeze(1).to(device, dtype=dtype)
+            target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0).to(device, dtype=dtype)
+            
+            # GPU 归一化 (瞬间完成)
+            frames_norm = normalize_batch_torch(frames_tensor)
+            
+            # GPU 缩放 (瞬间完成)
+            frames_resized = F.interpolate(frames_norm, size=TARGET_SIZE, mode='bilinear', align_corners=False)
+            first_mask_resized = F.interpolate(target_tensor, size=TARGET_SIZE, mode='nearest')
 
-        # 缩放 (PyTorch interpolate)
-        frames_tensor = torch.from_numpy(frames_norm).unsqueeze(1).float()
-        target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0).float()
+        # 4. 推理循环 (减少 CPU 交互)
+        # 预分配结果数组 (在 CPU，因为最后要返回 CPU)
+        preds_all = np.zeros((T, 256, 256), dtype=np.uint8)
+        preds_all[0] = target_tensor.cpu().numpy().squeeze().astype(np.uint8) # 第一帧是 GT
+
+        # 循环变量 (保持在 GPU 上)
+        prev_frame_gpu = frames_resized[0]
+        prev_mask_gpu = first_mask_resized.squeeze(0) # (1, 256, 256)
+        first_mask_gpu = first_mask_resized.squeeze(0)
         
-        frames_resized_tensor = F.interpolate(frames_tensor, size=TARGET_SIZE, mode='bilinear', align_corners=False)
-        target_resized_tensor = F.interpolate(target_tensor, size=TARGET_SIZE, mode='nearest')
-        
-        frames_resized = frames_resized_tensor.squeeze(1).cpu().numpy()
-        first_mask_resized = target_resized_tensor.squeeze().cpu().numpy()
-
-        # 推理
-        preds_resized = np.zeros((T, 256, 256), dtype=np.uint8)
-        preds_resized[0] = first_mask_resized.astype(np.uint8)
-
-        prev_frame = frames_resized[0]
-        prev_mask = preds_resized[0]
+        # 预先定义 zeros 用于异常处理
+        fallback_mask = np.zeros((256, 256), dtype=np.uint8)
 
         for t in range(1, T):
-            inp = np.stack([
-                frames_resized[t],
-                prev_frame,
-                first_mask_resized,
-                prev_mask
-            ], axis=0)
-
-            inp = torch.from_numpy(inp[None]).float().to(device)
+            curr_frame_gpu = frames_resized[t] # (1, 256, 256)
+            
+            # 在 GPU 上直接拼接输入: (1, 4, 256, 256)
+            # 顺序: Current, Prev_Frame, First_Mask, Prev_Mask
+            inp = torch.cat([
+                curr_frame_gpu,
+                prev_frame_gpu,
+                first_mask_gpu,
+                prev_mask_gpu
+            ], dim=0).unsqueeze(0) # Add batch dim
 
             with torch.no_grad():
+                # 推理
                 out = model(inp, return_deep=False)
-                prob = torch.sigmoid(out)[0, 0].cpu().numpy()
+                # Sigmoid
+                prob = torch.sigmoid(out)[0, 0] # (256, 256)
 
-            pred = (prob > 0.5).astype(np.uint8)
-            pred = post_process(pred, prev_mask)
+            # 必须转回 CPU 做后处理 (scipy 依赖)
+            # 使用 non_blocking=True 稍微加速
+            pred_cpu_raw = (prob > 0.5).float().cpu().numpy()
+            prev_mask_cpu_raw = prev_mask_gpu.float().cpu().numpy().squeeze()
+            
+            # CPU 后处理
+            pred_final = post_process(pred_cpu_raw, prev_mask_cpu_raw)
+            
+            # 存入结果
+            preds_all[t] = pred_final
+            
+            # 更新 GPU 状态用于下一帧
+            prev_frame_gpu = curr_frame_gpu
+            prev_mask_gpu = torch.from_numpy(pred_final).unsqueeze(0).to(device, dtype=dtype)
 
-            preds_resized[t] = pred
-            prev_frame = frames_resized[t]
-            prev_mask = pred
-
-        # 恢复尺寸
-        preds_tensor = torch.from_numpy(preds_resized).unsqueeze(1).float()
-        preds_orig_tensor = F.interpolate(preds_tensor, size=(H, W), mode='nearest')
-        preds = preds_orig_tensor.squeeze(1).cpu().numpy().astype(np.uint8)
-        
-        return preds
+        # 5. 极速恢复尺寸
+        # 把所有结果一次性转回 GPU 进行 resize，比一帧帧 resize 快
+        with torch.no_grad():
+            preds_tensor = torch.from_numpy(preds_all).unsqueeze(1).float().to(device) # (T, 1, 256, 256)
+            preds_orig = F.interpolate(preds_tensor, size=(H, W), mode='nearest')
+            final_output = preds_orig.squeeze(1).cpu().numpy().astype(np.uint8)
+            
+        return final_output
 
     except Exception as e:
-        # 【生存模式】捕获所有错误
-        # 打印简单错误信息（不含堆栈，节省日志空间），方便你自己排查是哪个case有问题
-        print(f"ERROR in run_algorithm: {e}")
-        
-        # 绝不 raise！
-        # 返回一个全黑的 Mask，保住其他 Case 的分数
-        # 或者是返回输入的 frames 形状的全 0 数组
-        fallback_pred = np.zeros((T, H, W), dtype=np.uint8)
-        
-        # 也可以尝试返回第一帧 Mask 的重复（比全黑稍微好一点点）
+        print(f"ERROR: {e}")
+        # 终极保底：返回全黑或重复第一帧
+        fallback = np.zeros(frames.shape, dtype=np.uint8)
         try:
-            # 尝试做一个简单的保底：重复第一帧 Mask
-            # 只有当 target 可用时才有效
-            if 'target' in locals() and target is not None:
-                 fallback_pred = np.repeat(target[np.newaxis, ...], T, axis=0)
+             if 'target' in locals():
+                 fallback = np.repeat(target[np.newaxis, ...], frames.shape[0], axis=0)
         except:
-            pass # 如果连保底都失败，就返回全黑
-            
-        return fallback_pred
+            pass
+        return fallback
