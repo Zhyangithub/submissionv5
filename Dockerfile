@@ -15,20 +15,20 @@ RUN python -m pip install \
     scipy \
     simpleitk
 
-# 3. 复制 Python 代码 (注意这里改成了 v3)
+# 3. 复制 Python 代码 (注意这里改成 v3)
 COPY --chown=user:user trackrad_unet_v3.py /opt/app/
 COPY --chown=user:user inference.py /opt/app/
 COPY --chown=user:user model.py /opt/app/
 
 # 4. 直接复制模型 (7MB 不需要分卷拼接)
-# 请确保 best_model.pth 在你本地的 resources 文件夹里
+# 请确保 best_model.pth 已经在 resources 文件夹里
 COPY --chown=user:user resources/best_model.pth /opt/app/resources/best_model.pth
 
-# 5. 【修改点】检查文件大小
-# 之前的限制是 100MB，现在改成 5MB 即可，确保模型存在
+# 5. 检查文件大小
+# 【重要修改】只要大于 5MB 就算成功 (适配你的 7MB 模型)
 RUN python -c "import os, sys; \
     size = os.path.getsize('/opt/app/resources/best_model.pth') / (1024*1024); \
     print(f'Final model size: {size:.2f} MB'); \
-    sys.exit(1) if size < 5 else None"  # <--- 修改了这里，只要大于 5MB 就通过
+    sys.exit(1) if size < 5 else None"
 
 ENTRYPOINT ["python", "inference.py"]

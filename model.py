@@ -16,7 +16,7 @@ except ImportError:
     pass
 
 # ===============================
-# Main Algorithm (Pure GPU Version)
+# Main Algorithm (GPU Speed Version)
 # ===============================
 def run_algorithm(
     frames: np.ndarray,
@@ -40,9 +40,7 @@ def run_algorithm(
         
         TARGET_SIZE = (256, 256)
         
-        # ⚡️ 极速跳帧策略
-        # 既然模型只有 7MB，速度极快，Skip=2 甚至 Skip=1 (不跳) 可能都行
-        # 为了稳妥拿到分，我们先保持 Skip=3 或者 Skip=2
+        # ⚡️ 跳帧策略：模型极快，Skip=2 足够稳
         SKIP_STEP = 2 
         
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,19 +56,18 @@ def run_algorithm(
         model.to(device)
         
         if device.type == 'cuda':
-            model.half()
-            # 7MB 模型非常适合编译优化，但为了防止兼容性问题，先注释掉
-            # model = torch.compile(model) 
+            model.half() # 开启 FP16 加速
         model.eval()
 
-        # 4. 全局 GPU 预处理
+        # 4. 全局 GPU 预处理 (必写！否则 CPU 会慢)
         with torch.no_grad():
             dtype = torch.float16 if device.type == 'cuda' else torch.float32
             
+            # 把数据搬到 GPU
             frames_tensor = torch.from_numpy(frames).unsqueeze(1).to(device, dtype=dtype)
             target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0).to(device, dtype=dtype)
             
-            # 归一化
+            # GPU 归一化
             frames_tensor = torch.nan_to_num(frames_tensor, nan=0.0, posinf=0.0, neginf=0.0)
             B, C, h_raw, w_raw = frames_tensor.shape
             flat = frames_tensor.view(B, -1)
@@ -80,7 +77,7 @@ def run_algorithm(
             div[div < 1e-8] = 1.0
             frames_norm = ((flat - mins) / div).view(B, C, h_raw, w_raw)
             
-            # 缩放
+            # GPU 缩放
             frames_resized = F.interpolate(frames_norm, size=TARGET_SIZE, mode='bilinear', align_corners=False)
             first_mask_resized = F.interpolate(target_tensor, size=TARGET_SIZE, mode='nearest')
 
@@ -89,11 +86,13 @@ def run_algorithm(
         prev_mask_gpu = first_mask_resized.squeeze(0)
         first_mask_gpu = first_mask_resized.squeeze(0)
         
+        # 结果容器 (GPU)
         preds_gpu_list = [prev_mask_gpu.unsqueeze(0)]
 
         for t in range(1, T):
             curr_frame_gpu = frames_resized[t]
             
+            # 跳帧
             if t % SKIP_STEP != 0:
                 preds_gpu_list.append(prev_mask_gpu.unsqueeze(0))
                 prev_frame_gpu = curr_frame_gpu
@@ -111,6 +110,7 @@ def run_algorithm(
                 out = model(inp, return_deep=False)
                 prob = torch.sigmoid(out)
 
+            # 简单的时序平滑
             current_pred = (prob > 0.5).float()
             smooth_pred = 0.7 * current_pred + 0.3 * prev_mask_gpu.unsqueeze(0)
             final_pred_gpu = (smooth_pred > 0.5).float().squeeze(0)
@@ -120,7 +120,7 @@ def run_algorithm(
             prev_frame_gpu = curr_frame_gpu
             prev_mask_gpu = final_pred_gpu
 
-        # 6. 输出
+        # 6. 输出恢复
         with torch.no_grad():
             all_preds_tensor = torch.cat(preds_gpu_list, dim=0).to(dtype)
             preds_orig = F.interpolate(all_preds_tensor, size=(H, W), mode='nearest')
@@ -129,8 +129,8 @@ def run_algorithm(
         return final_output
 
     except Exception as e:
-        # 生存模式：返回静态复制
         print(f"ERROR: {e}")
+        # 保底：静态复制
         try:
              return np.repeat(target[np.newaxis, ...], T, axis=0)
         except:
